@@ -2,21 +2,27 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
 type config struct {
-	apiURL     string
-	apiToken   string
-	relayURLs  []string
-	relayTokens []string
+	apiURL       string
+	apiToken     string
+	relayURLs    []string
+	relayTokens  []string
+	listenAddr   string
+	syncInterval time.Duration
 }
 
 type uuidsResponse struct {
@@ -36,19 +42,116 @@ type syncResponse struct {
 	Error     string `json:"error,omitempty"`
 }
 
+type relayResult struct {
+	Relay     string `json:"relay"`
+	Status    string `json:"status"`
+	Changed   bool   `json:"changed"`
+	UserCount int    `json:"user_count"`
+	Error     string `json:"error,omitempty"`
+}
+
+type triggerResponse struct {
+	Status   string        `json:"status"`
+	UUIDs    int           `json:"uuids"`
+	Relays   []relayResult `json:"relays"`
+	Duration string        `json:"duration"`
+}
+
+var syncMu sync.Mutex
+
 func main() {
 	cfg := mustLoadConfig()
 
-	log.Printf("relay-sync: api=%s relays=%d", cfg.apiURL, len(cfg.relayURLs))
+	log.Printf("relay-sync: api=%s relays=%d listen=%s interval=%s",
+		cfg.apiURL, len(cfg.relayURLs), cfg.listenAddr, cfg.syncInterval)
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	mux.HandleFunc("POST /trigger", func(w http.ResponseWriter, r *http.Request) {
+		result, err := runSync(cfg)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"error":  err.Error(),
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(result)
+	})
+
+	srv := &http.Server{
+		Addr:    cfg.listenAddr,
+		Handler: mux,
+	}
+
+	// Start periodic sync goroutine
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		// Run an initial sync on startup
+		log.Println("running initial sync")
+		if _, err := runSync(cfg); err != nil {
+			log.Printf("initial sync error: %v", err)
+		}
+
+		ticker := time.NewTicker(cfg.syncInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				log.Println("periodic sync triggered")
+				if _, err := runSync(cfg); err != nil {
+					log.Printf("periodic sync error: %v", err)
+				}
+			}
+		}
+	}()
+
+	// Graceful shutdown
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		sig := <-sigCh
+		log.Printf("received %v, shutting down", sig)
+		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		srv.Shutdown(shutdownCtx)
+	}()
+
+	log.Printf("listening on %s", cfg.listenAddr)
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("server error: %v", err)
+	}
+	log.Println("server stopped")
+}
+
+func runSync(cfg config) (*triggerResponse, error) {
+	syncMu.Lock()
+	defer syncMu.Unlock()
+
+	start := time.Now()
 
 	uuids, err := fetchActiveUUIDs(cfg)
 	if err != nil {
-		log.Fatalf("failed to fetch active UUIDs: %v", err)
+		return nil, fmt.Errorf("fetch UUIDs: %w", err)
 	}
 
 	log.Printf("fetched %d active UUIDs", len(uuids))
 
+	results := make([]relayResult, 0, len(cfg.relayURLs))
 	hasError := false
+
 	for i, relayURL := range cfg.relayURLs {
 		token := cfg.relayTokens[i]
 		syncURL := strings.TrimRight(relayURL, "/") + "/sync"
@@ -56,6 +159,11 @@ func main() {
 		resp, err := pushToRelay(syncURL, token, uuids)
 		if err != nil {
 			log.Printf("relay %s: ERROR: %v", relayURL, err)
+			results = append(results, relayResult{
+				Relay:  relayURL,
+				Status: "error",
+				Error:  err.Error(),
+			})
 			hasError = true
 			continue
 		}
@@ -65,11 +173,26 @@ func main() {
 		} else {
 			log.Printf("relay %s: unchanged (%d users)", relayURL, resp.UserCount)
 		}
+
+		results = append(results, relayResult{
+			Relay:     relayURL,
+			Status:    "ok",
+			Changed:   resp.Changed,
+			UserCount: resp.UserCount,
+		})
 	}
 
+	status := "ok"
 	if hasError {
-		os.Exit(1)
+		status = "partial_error"
 	}
+
+	return &triggerResponse{
+		Status:   status,
+		UUIDs:    len(uuids),
+		Relays:   results,
+		Duration: time.Since(start).String(),
+	}, nil
 }
 
 func mustLoadConfig() config {
@@ -100,11 +223,27 @@ func mustLoadConfig() config {
 		log.Fatalf("RELAY_URLS count (%d) != RELAY_TOKENS count (%d)", len(relayURLs), len(relayTokens))
 	}
 
+	listenAddr := os.Getenv("LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = ":8080"
+	}
+
+	syncInterval := 120 * time.Second
+	if s := os.Getenv("SYNC_INTERVAL"); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			log.Fatalf("invalid SYNC_INTERVAL %q: %v", s, err)
+		}
+		syncInterval = d
+	}
+
 	return config{
-		apiURL:      apiURL,
-		apiToken:    apiToken,
-		relayURLs:   relayURLs,
-		relayTokens: relayTokens,
+		apiURL:       apiURL,
+		apiToken:     apiToken,
+		relayURLs:    relayURLs,
+		relayTokens:  relayTokens,
+		listenAddr:   listenAddr,
+		syncInterval: syncInterval,
 	}
 }
 
