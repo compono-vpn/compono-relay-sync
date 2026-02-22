@@ -116,6 +116,8 @@ func fetchActiveUUIDs(cfg config) ([]string, error) {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.apiToken)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-For", "127.0.0.1")
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
