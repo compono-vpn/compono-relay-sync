@@ -42,7 +42,7 @@ jobs:
   build-amd64:
     name: Build amd64
     needs: generate-tag
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     permissions:
       contents: read
       packages: write
@@ -67,8 +67,6 @@ jobs:
           platforms: linux/amd64
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.generate-tag.outputs.sha_short }}-amd64
-          cache-from: type=gha,scope=amd64
-          cache-to: type=gha,scope=amd64,mode=max
 
   build-arm64:
     name: Build arm64
@@ -98,8 +96,6 @@ jobs:
           platforms: linux/arm64
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.generate-tag.outputs.sha_short }}-arm64
-          cache-from: type=gha,scope=arm64
-          cache-to: type=gha,scope=arm64,mode=max
 
   manifest:
     name: Create Multi-Arch Manifest
