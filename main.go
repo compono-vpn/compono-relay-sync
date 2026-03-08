@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -223,10 +226,7 @@ func mustLoadConfig() config {
 		log.Fatalf("RELAY_URLS count (%d) != RELAY_TOKENS count (%d)", len(relayURLs), len(relayTokens))
 	}
 
-	listenAddr := os.Getenv("LISTEN_ADDR")
-	if listenAddr == "" {
-		listenAddr = ":8080"
-	}
+	listenAddr := cmp.Or(os.Getenv("LISTEN_ADDR"), ":8080")
 
 	syncInterval := 120 * time.Second
 	if s := os.Getenv("SYNC_INTERVAL"); s != "" {
@@ -282,6 +282,16 @@ func fetchActiveUUIDs(cfg config) ([]string, error) {
 	return result.Response.UUIDs, nil
 }
 
+// relayClient is an HTTP client that skips TLS verification for relay agents
+// using self-signed certificates.
+var relayClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+	},
+}
+
 func pushToRelay(syncURL, token string, uuids []string) (*syncResponse, error) {
 	payload, err := json.Marshal(syncRequest{UUIDs: uuids})
 	if err != nil {
@@ -295,8 +305,7 @@ func pushToRelay(syncURL, token string, uuids []string) (*syncResponse, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := relayClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
