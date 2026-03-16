@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -112,7 +113,6 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				log.Println("periodic sync triggered")
 				if _, err := runSync(cfg); err != nil {
 					log.Printf("periodic sync error: %v", err)
 				}
@@ -150,39 +150,52 @@ func runSync(cfg config) (*triggerResponse, error) {
 		return nil, fmt.Errorf("fetch UUIDs: %w", err)
 	}
 
-	log.Printf("fetched %d active UUIDs", len(uuids))
+	slices.Sort(uuids)
 
-	results := make([]relayResult, 0, len(cfg.relayURLs))
-	hasError := false
+	resultsCh := make(chan relayResult, len(cfg.relayURLs))
+	var wg sync.WaitGroup
 
 	for i, relayURL := range cfg.relayURLs {
 		token := cfg.relayTokens[i]
-		syncURL := strings.TrimRight(relayURL, "/") + "/sync"
+		wg.Add(1)
+		go func(relayURL, token string) {
+			defer wg.Done()
+			syncURL := strings.TrimRight(relayURL, "/") + "/sync"
 
-		resp, err := pushToRelay(syncURL, token, uuids)
-		if err != nil {
-			log.Printf("relay %s: ERROR: %v", relayURL, err)
-			results = append(results, relayResult{
-				Relay:  relayURL,
-				Status: "error",
-				Error:  err.Error(),
-			})
+			resp, err := pushToRelay(syncURL, token, uuids)
+			if err != nil {
+				log.Printf("relay %s: ERROR: %v", relayURL, err)
+				resultsCh <- relayResult{
+					Relay:  relayURL,
+					Status: "error",
+					Error:  err.Error(),
+				}
+				return
+			}
+
+			if resp.Changed {
+				log.Printf("relay %s: CHANGED (now %d users)", relayURL, resp.UserCount)
+			}
+
+			resultsCh <- relayResult{
+				Relay:     relayURL,
+				Status:    "ok",
+				Changed:   resp.Changed,
+				UserCount: resp.UserCount,
+			}
+		}(relayURL, token)
+	}
+
+	wg.Wait()
+	close(resultsCh)
+
+	results := make([]relayResult, 0, len(cfg.relayURLs))
+	hasError := false
+	for r := range resultsCh {
+		if r.Status == "error" {
 			hasError = true
-			continue
 		}
-
-		if resp.Changed {
-			log.Printf("relay %s: CHANGED (now %d users)", relayURL, resp.UserCount)
-		} else {
-			log.Printf("relay %s: unchanged (%d users)", relayURL, resp.UserCount)
-		}
-
-		results = append(results, relayResult{
-			Relay:     relayURL,
-			Status:    "ok",
-			Changed:   resp.Changed,
-			UserCount: resp.UserCount,
-		})
+		results = append(results, r)
 	}
 
 	status := "ok"
@@ -228,7 +241,7 @@ func mustLoadConfig() config {
 
 	listenAddr := cmp.Or(os.Getenv("LISTEN_ADDR"), ":8080")
 
-	syncInterval := 120 * time.Second
+	syncInterval := 1 * time.Second
 	if s := os.Getenv("SYNC_INTERVAL"); s != "" {
 		d, err := time.ParseDuration(s)
 		if err != nil {
