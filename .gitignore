@@ -1,1 +1,6 @@
 bin/*
+.idea/
+.DS_Store
+.env
+*.env
+compono-relay-sync
