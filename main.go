@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type config struct {
@@ -52,6 +54,7 @@ type relayResult struct {
 	Changed   bool   `json:"changed"`
 	UserCount int    `json:"user_count"`
 	Error     string `json:"error,omitempty"`
+	Skipped   bool   `json:"skipped,omitempty"`
 }
 
 type triggerResponse struct {
@@ -61,10 +64,18 @@ type triggerResponse struct {
 	Duration string        `json:"duration"`
 }
 
+type healthResponse struct {
+	Status       string   `json:"status"`
+	RelayCount   int      `json:"relay_count"`
+	DegradedList []string `json:"degraded_relays,omitempty"`
+}
+
 var syncMu sync.Mutex
 
 func main() {
 	cfg := mustLoadConfig()
+	tracker := newRelayTracker(cfg.relayURLs)
+	metrics := newSyncMetrics()
 
 	log.Printf("relay-sync: api=%s relays=%d listen=%s interval=%s",
 		cfg.apiURL, len(cfg.relayURLs), cfg.listenAddr, cfg.syncInterval)
@@ -73,22 +84,51 @@ func main() {
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok"}`))
+
+		snap := tracker.snapshot()
+		var degraded []string
+		for relay, state := range snap {
+			if state.ConsecFails >= degradedThreshold {
+				degraded = append(degraded, relay)
+			}
+		}
+		slices.Sort(degraded)
+
+		status := "ok"
+		if len(degraded) > 0 {
+			status = "degraded"
+		}
+
+		resp := healthResponse{
+			Status:       status,
+			RelayCount:   len(cfg.relayURLs),
+			DegradedList: degraded,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		snap := tracker.snapshot()
+		_ = json.NewEncoder(w).Encode(snap)
 	})
 
 	mux.HandleFunc("POST /trigger", func(w http.ResponseWriter, r *http.Request) {
-		result, err := runSync(cfg)
+		// Manual trigger bypasses backoff.
+		result, err := runSync(cfg, tracker, metrics, true)
 		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]string{
+			_ = json.NewEncoder(w).Encode(map[string]string{
 				"status": "error",
 				"error":  err.Error(),
 			})
 			return
 		}
-		json.NewEncoder(w).Encode(result)
+		_ = json.NewEncoder(w).Encode(result)
 	})
+
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	srv := &http.Server{
 		Addr:    cfg.listenAddr,
@@ -102,7 +142,7 @@ func main() {
 	go func() {
 		// Run an initial sync on startup
 		log.Println("running initial sync")
-		if _, err := runSync(cfg); err != nil {
+		if _, err := runSync(cfg, tracker, metrics, false); err != nil {
 			log.Printf("initial sync error: %v", err)
 		}
 
@@ -113,7 +153,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if _, err := runSync(cfg); err != nil {
+				if _, err := runSync(cfg, tracker, metrics, false); err != nil {
 					log.Printf("periodic sync error: %v", err)
 				}
 			}
@@ -129,7 +169,9 @@ func main() {
 		cancel()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
-		srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown error: %v", err)
+		}
 	}()
 
 	log.Printf("listening on %s", cfg.listenAddr)
@@ -139,7 +181,7 @@ func main() {
 	log.Println("server stopped")
 }
 
-func runSync(cfg config) (*triggerResponse, error) {
+func runSync(cfg config, tracker *relayTracker, metrics *syncMetrics, bypassBackoff bool) (*triggerResponse, error) {
 	syncMu.Lock()
 	defer syncMu.Unlock()
 
@@ -157,18 +199,38 @@ func runSync(cfg config) (*triggerResponse, error) {
 
 	for i, relayURL := range cfg.relayURLs {
 		token := cfg.relayTokens[i]
+
+		// Check backoff unless this is a manual trigger.
+		if !bypassBackoff && tracker.shouldSkip(relayURL, time.Now()) {
+			log.Printf("relay %s: skipped (backoff, %d consecutive failures)",
+				relayURL, tracker.consecutiveFailures(relayURL))
+			resultsCh <- relayResult{
+				Relay:   relayURL,
+				Status:  "skipped",
+				Skipped: true,
+			}
+			continue
+		}
+
 		wg.Add(1)
 		go func(relayURL, token string) {
 			defer wg.Done()
 			syncURL := strings.TrimRight(relayURL, "/") + "/sync"
+			relayStart := time.Now()
 
-			resp, err := pushToRelay(syncURL, token, uuids)
-			if err != nil {
-				log.Printf("relay %s: ERROR: %v", relayURL, err)
+			resp, syncErr := pushToRelay(syncURL, token, uuids)
+			duration := time.Since(relayStart).Seconds()
+			now := time.Now()
+
+			if syncErr != nil {
+				log.Printf("relay %s: ERROR: %v", relayURL, syncErr)
+				tracker.recordFailure(relayURL, now, syncErr.Error())
+				consecFails := tracker.consecutiveFailures(relayURL)
+				metrics.recordRun(relayURL, "error", duration, consecFails)
 				resultsCh <- relayResult{
 					Relay:  relayURL,
 					Status: "error",
-					Error:  err.Error(),
+					Error:  syncErr.Error(),
 				}
 				return
 			}
@@ -176,6 +238,9 @@ func runSync(cfg config) (*triggerResponse, error) {
 			if resp.Changed {
 				log.Printf("relay %s: CHANGED (now %d users)", relayURL, resp.UserCount)
 			}
+
+			tracker.recordSuccess(relayURL, now, resp.UserCount, resp.Changed)
+			metrics.recordRun(relayURL, "success", duration, 0)
 
 			resultsCh <- relayResult{
 				Relay:     relayURL,
@@ -276,7 +341,7 @@ func fetchActiveUUIDs(cfg config) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -301,7 +366,7 @@ var relayClient = &http.Client{
 	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		DialContext:     (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 	},
 }
 
@@ -322,7 +387,7 @@ func pushToRelay(syncURL, token string, uuids []string) (*syncResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
