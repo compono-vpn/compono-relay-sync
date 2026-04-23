@@ -37,3 +37,49 @@ func (m *syncMetrics) recordRun(relay, status string, durationSec float64, conse
 	m.syncDuration.WithLabelValues(relay).Observe(durationSec)
 	m.consecutiveFailures.WithLabelValues(relay).Set(float64(consecFails))
 }
+
+// Exit-node sync drift metrics (step-1 observer).
+// Target label = node name ("FI-HEL-Exit-01"), tag = inbound tag.
+// Cardinality stays bounded: ~4-8 exits × ~1-2 inbounds per exit.
+type exitMetrics struct {
+	expectedUsers  *prometheus.GaugeVec
+	actualUsers    *prometheus.GaugeVec
+	missingUsers   *prometheus.GaugeVec
+	staleUsers     *prometheus.GaugeVec
+	lastSuccess    *prometheus.GaugeVec
+	observerErrors *prometheus.CounterVec
+}
+
+func newExitMetrics() *exitMetrics {
+	return &exitMetrics{
+		expectedUsers: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "compono_sync_expected_users",
+			Help: "Active panel users that should be provisioned on target for this inbound tag",
+		}, []string{"target", "tag"}),
+
+		actualUsers: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "compono_sync_actual_users",
+			Help: "Users currently in xray on target for this inbound tag",
+		}, []string{"target", "tag"}),
+
+		missingUsers: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "compono_sync_missing_users",
+			Help: "Active panel users absent from target's xray for this inbound tag (BDT-27 new-user breakage)",
+		}, []string{"target", "tag"}),
+
+		staleUsers: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "compono_sync_stale_users",
+			Help: "Users on target's xray that are no longer ACTIVE in panel (BDT-27 undefined-payload remove failure)",
+		}, []string{"target", "tag"}),
+
+		lastSuccess: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "compono_sync_last_success_timestamp_seconds",
+			Help: "Unix timestamp of the last successful observation of this target",
+		}, []string{"target"}),
+
+		observerErrors: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "compono_sync_observer_errors_total",
+			Help: "Errors encountered by the exit-node observer, labelled by phase (fetch_nodes, fetch_expected, fetch_actual)",
+		}, []string{"phase"}),
+	}
+}
