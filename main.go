@@ -23,12 +23,13 @@ import (
 )
 
 type config struct {
-	apiURL       string
-	apiToken     string
-	relayURLs    []string
-	relayTokens  []string
-	listenAddr   string
-	syncInterval time.Duration
+	apiURL               string
+	apiToken             string
+	relayURLs            []string
+	relayTokens          []string
+	listenAddr           string
+	syncInterval         time.Duration
+	exitObserverInterval time.Duration
 }
 
 type uuidsResponse struct {
@@ -76,9 +77,10 @@ func main() {
 	cfg := mustLoadConfig()
 	tracker := newRelayTracker(cfg.relayURLs)
 	metrics := newSyncMetrics()
+	exitMetrics := newExitMetrics()
 
-	log.Printf("relay-sync: api=%s relays=%d listen=%s interval=%s",
-		cfg.apiURL, len(cfg.relayURLs), cfg.listenAddr, cfg.syncInterval)
+	log.Printf("relay-sync: api=%s relays=%d listen=%s interval=%s exit_observer_interval=%s",
+		cfg.apiURL, len(cfg.relayURLs), cfg.listenAddr, cfg.syncInterval, cfg.exitObserverInterval)
 
 	mux := http.NewServeMux()
 
@@ -159,6 +161,21 @@ func main() {
 			}
 		}
 	}()
+
+	// Exit-node drift observer (step-1: metrics only, no reconciliation).
+	// Skipped entirely if EXIT_OBSERVER_INTERVAL is 0 — avoids perma-spam
+	// during local dev where the panel isn't reachable.
+	if cfg.exitObserverInterval > 0 {
+		observer := newExitObserver(
+			cfg.apiURL,
+			cfg.apiToken,
+			cfg.exitObserverInterval,
+			exitMetrics,
+		)
+		go observer.run(ctx)
+	} else {
+		log.Println("exit-observer disabled (EXIT_OBSERVER_INTERVAL=0)")
+	}
 
 	// Graceful shutdown
 	go func() {
@@ -315,13 +332,23 @@ func mustLoadConfig() config {
 		syncInterval = d
 	}
 
+	exitObserverInterval := 60 * time.Second
+	if s := os.Getenv("EXIT_OBSERVER_INTERVAL"); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			log.Fatalf("invalid EXIT_OBSERVER_INTERVAL %q: %v", s, err)
+		}
+		exitObserverInterval = d
+	}
+
 	return config{
-		apiURL:       apiURL,
-		apiToken:     apiToken,
-		relayURLs:    relayURLs,
-		relayTokens:  relayTokens,
-		listenAddr:   listenAddr,
-		syncInterval: syncInterval,
+		apiURL:               apiURL,
+		apiToken:             apiToken,
+		relayURLs:            relayURLs,
+		relayTokens:          relayTokens,
+		listenAddr:           listenAddr,
+		syncInterval:         syncInterval,
+		exitObserverInterval: exitObserverInterval,
 	}
 }
 
