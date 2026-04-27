@@ -68,21 +68,47 @@ type actualUsersResponse struct {
 	} `json:"response"`
 }
 
-type exitObserver struct {
-	panelURL   string
-	apiToken   string
-	httpClient *http.Client
-	metrics    *exitMetrics
-	interval   time.Duration
+type reconcileResponse struct {
+	Response struct {
+		NodeUUID string `json:"nodeUuid"`
+		Added    []struct {
+			Username string   `json:"username"`
+			Tags     []string `json:"tags"`
+		} `json:"added"`
+		Removed []struct {
+			Username string   `json:"username"`
+			Tags     []string `json:"tags"`
+		} `json:"removed"`
+		Errors []struct {
+			Username string `json:"username"`
+			Tag      string `json:"tag"`
+			Phase    string `json:"phase"`
+			Error    string `json:"error"`
+		} `json:"errors"`
+		UnreachableTags []string `json:"unreachableTags"`
+		Skipped         bool     `json:"skipped"`
+		SkipReason      *string  `json:"skipReason"`
+	} `json:"response"`
 }
 
-func newExitObserver(panelURL, apiToken string, interval time.Duration, metrics *exitMetrics) *exitObserver {
+type exitObserver struct {
+	panelURL          string
+	apiToken          string
+	httpClient        *http.Client
+	metrics           *exitMetrics
+	interval          time.Duration
+	reconcileEnabled  bool
+	reconcileEndpoint string // override for tests; "" means panelURL+"/api/nodes/:uuid/reconcile-users"
+}
+
+func newExitObserver(panelURL, apiToken string, interval time.Duration, metrics *exitMetrics, reconcileEnabled bool) *exitObserver {
 	return &exitObserver{
-		panelURL:   strings.TrimRight(panelURL, "/"),
-		apiToken:   apiToken,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		metrics:    metrics,
-		interval:   interval,
+		panelURL:         strings.TrimRight(panelURL, "/"),
+		apiToken:         apiToken,
+		httpClient:       &http.Client{Timeout: 60 * time.Second},
+		metrics:          metrics,
+		interval:         interval,
+		reconcileEnabled: reconcileEnabled,
 	}
 }
 
@@ -207,6 +233,88 @@ func (o *exitObserver) observeNode(ctx context.Context, n panelNode) {
 	}
 
 	o.metrics.lastSuccess.WithLabelValues(n.Name).SetToCurrentTime()
+
+	// Step-2 writer: if EXIT_OBSERVER_RECONCILE is on, ask compono-backend to
+	// converge xray with the panel DB for this node. Backend does the actual
+	// add/remove RPCs synchronously; we just trigger and tally. Replaces the
+	// flaky AddUserToNodeEvent push (BDT-27) — the user said: "those kafka
+	// messages and pushes will NEVER be reliable".
+	if o.reconcileEnabled {
+		o.callReconcile(ctx, n)
+	}
+}
+
+// callReconcile invokes POST /api/nodes/:uuid/reconcile-users on the panel.
+// Errors are logged + counted; never propagated, since the next observer tick
+// will retry. We bump reconcile-{added,removed} by len(added)/len(removed)
+// so a Grafana timeseries shows the convergence work over time.
+func (o *exitObserver) callReconcile(ctx context.Context, n panelNode) {
+	endpoint := o.reconcileEndpoint
+	if endpoint == "" {
+		endpoint = fmt.Sprintf("%s/api/nodes/%s/reconcile-users", o.panelURL, n.UUID)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, nil)
+	if err != nil {
+		o.metrics.observerErrors.WithLabelValues("reconcile").Inc()
+		o.metrics.reconcileCalls.WithLabelValues(n.Name, "error").Inc()
+		log.Printf("exit-observer %s: reconcile build request: %v", n.Name, err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+o.apiToken)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-For", "127.0.0.1")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := o.httpClient.Do(req)
+	if err != nil {
+		o.metrics.observerErrors.WithLabelValues("reconcile").Inc()
+		o.metrics.reconcileCalls.WithLabelValues(n.Name, "error").Inc()
+		log.Printf("exit-observer %s: reconcile request: %v", n.Name, err)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		o.metrics.observerErrors.WithLabelValues("reconcile").Inc()
+		o.metrics.reconcileCalls.WithLabelValues(n.Name, "error").Inc()
+		log.Printf("exit-observer %s: reconcile read body: %v", n.Name, err)
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		o.metrics.observerErrors.WithLabelValues("reconcile").Inc()
+		o.metrics.reconcileCalls.WithLabelValues(n.Name, "error").Inc()
+		log.Printf("exit-observer %s: reconcile http %d: %s", n.Name, resp.StatusCode, string(body))
+		return
+	}
+
+	var out reconcileResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		o.metrics.observerErrors.WithLabelValues("reconcile").Inc()
+		o.metrics.reconcileCalls.WithLabelValues(n.Name, "error").Inc()
+		log.Printf("exit-observer %s: reconcile decode: %v", n.Name, err)
+		return
+	}
+
+	if out.Response.Skipped {
+		o.metrics.reconcileCalls.WithLabelValues(n.Name, "skipped").Inc()
+		reason := ""
+		if out.Response.SkipReason != nil {
+			reason = *out.Response.SkipReason
+		}
+		log.Printf("exit-observer %s: reconcile SKIPPED (%s)", n.Name, reason)
+		return
+	}
+
+	o.metrics.reconcileCalls.WithLabelValues(n.Name, "ok").Inc()
+	o.metrics.reconcileAdded.WithLabelValues(n.Name).Add(float64(len(out.Response.Added)))
+	o.metrics.reconcileRemoved.WithLabelValues(n.Name).Add(float64(len(out.Response.Removed)))
+
+	if len(out.Response.Added) > 0 || len(out.Response.Removed) > 0 || len(out.Response.Errors) > 0 {
+		log.Printf("exit-observer %s: reconcile added=%d removed=%d errors=%d",
+			n.Name, len(out.Response.Added), len(out.Response.Removed), len(out.Response.Errors))
+	}
 }
 
 func (o *exitObserver) fetchConnectedNodes(ctx context.Context) ([]panelNode, error) {

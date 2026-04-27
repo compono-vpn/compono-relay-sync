@@ -23,13 +23,14 @@ import (
 )
 
 type config struct {
-	apiURL               string
-	apiToken             string
-	relayURLs            []string
-	relayTokens          []string
-	listenAddr           string
-	syncInterval         time.Duration
-	exitObserverInterval time.Duration
+	apiURL                string
+	apiToken              string
+	relayURLs             []string
+	relayTokens           []string
+	listenAddr            string
+	syncInterval          time.Duration
+	exitObserverInterval  time.Duration
+	exitObserverReconcile bool
 }
 
 type uuidsResponse struct {
@@ -79,8 +80,8 @@ func main() {
 	metrics := newSyncMetrics()
 	exitMetrics := newExitMetrics()
 
-	log.Printf("relay-sync: api=%s relays=%d listen=%s interval=%s exit_observer_interval=%s",
-		cfg.apiURL, len(cfg.relayURLs), cfg.listenAddr, cfg.syncInterval, cfg.exitObserverInterval)
+	log.Printf("relay-sync: api=%s relays=%d listen=%s interval=%s exit_observer_interval=%s exit_observer_reconcile=%t",
+		cfg.apiURL, len(cfg.relayURLs), cfg.listenAddr, cfg.syncInterval, cfg.exitObserverInterval, cfg.exitObserverReconcile)
 
 	mux := http.NewServeMux()
 
@@ -171,6 +172,7 @@ func main() {
 			cfg.apiToken,
 			cfg.exitObserverInterval,
 			exitMetrics,
+			cfg.exitObserverReconcile,
 		)
 		go observer.run(ctx)
 	} else {
@@ -341,14 +343,31 @@ func mustLoadConfig() config {
 		exitObserverInterval = d
 	}
 
+	// EXIT_OBSERVER_RECONCILE: when "true", every observer cycle calls
+	// POST /api/nodes/:uuid/reconcile-users on compono-backend AFTER the
+	// drift metrics are emitted. The backend then issues add-user /
+	// remove-user RPCs to xray. Default off so a fresh deploy is safe.
+	exitObserverReconcile := false
+	if s := strings.ToLower(strings.TrimSpace(os.Getenv("EXIT_OBSERVER_RECONCILE"))); s != "" {
+		switch s {
+		case "1", "true", "yes", "on":
+			exitObserverReconcile = true
+		case "0", "false", "no", "off":
+			exitObserverReconcile = false
+		default:
+			log.Fatalf("invalid EXIT_OBSERVER_RECONCILE %q (want true/false)", s)
+		}
+	}
+
 	return config{
-		apiURL:               apiURL,
-		apiToken:             apiToken,
-		relayURLs:            relayURLs,
-		relayTokens:          relayTokens,
-		listenAddr:           listenAddr,
-		syncInterval:         syncInterval,
-		exitObserverInterval: exitObserverInterval,
+		apiURL:                apiURL,
+		apiToken:              apiToken,
+		relayURLs:             relayURLs,
+		relayTokens:           relayTokens,
+		listenAddr:            listenAddr,
+		syncInterval:          syncInterval,
+		exitObserverInterval:  exitObserverInterval,
+		exitObserverReconcile: exitObserverReconcile,
 	}
 }
 

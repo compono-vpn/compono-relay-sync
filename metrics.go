@@ -42,12 +42,15 @@ func (m *syncMetrics) recordRun(relay, status string, durationSec float64, conse
 // Target label = node name ("FI-HEL-Exit-01"), tag = inbound tag.
 // Cardinality stays bounded: ~4-8 exits × ~1-2 inbounds per exit.
 type exitMetrics struct {
-	expectedUsers  *prometheus.GaugeVec
-	actualUsers    *prometheus.GaugeVec
-	missingUsers   *prometheus.GaugeVec
-	staleUsers     *prometheus.GaugeVec
-	lastSuccess    *prometheus.GaugeVec
-	observerErrors *prometheus.CounterVec
+	expectedUsers    *prometheus.GaugeVec
+	actualUsers      *prometheus.GaugeVec
+	missingUsers     *prometheus.GaugeVec
+	staleUsers       *prometheus.GaugeVec
+	lastSuccess      *prometheus.GaugeVec
+	observerErrors   *prometheus.CounterVec
+	reconcileCalls   *prometheus.CounterVec
+	reconcileAdded   *prometheus.CounterVec
+	reconcileRemoved *prometheus.CounterVec
 }
 
 func newExitMetrics() *exitMetrics {
@@ -79,7 +82,24 @@ func newExitMetrics() *exitMetrics {
 
 		observerErrors: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "compono_sync_observer_errors_total",
-			Help: "Errors encountered by the exit-node observer, labelled by phase (fetch_nodes, fetch_expected, fetch_actual)",
+			Help: "Errors encountered by the exit-node observer, labelled by phase (fetch_nodes, fetch_expected, fetch_actual, reconcile)",
 		}, []string{"phase"}),
+
+		// Step-2: feature-flagged writer call into compono-backend's
+		// /api/nodes/:uuid/reconcile-users.
+		reconcileCalls: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "compono_sync_reconcile_calls_total",
+			Help: "POST /api/nodes/:uuid/reconcile-users invocations from the observer, by target and result (ok | error | skipped)",
+		}, []string{"target", "result"}),
+
+		reconcileAdded: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "compono_sync_reconcile_added_total",
+			Help: "Users added to target's xray by the observer's reconcile call",
+		}, []string{"target"}),
+
+		reconcileRemoved: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "compono_sync_reconcile_removed_total",
+			Help: "Users removed from target's xray by the observer's reconcile call",
+		}, []string{"target"}),
 	}
 }
