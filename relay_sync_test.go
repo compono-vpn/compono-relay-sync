@@ -5,12 +5,81 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+func TestParseRelayConfig_JSON(t *testing.T) {
+	got, err := parseRelayConfig(`[
+		{"name":"nl-relay","url":"https://176.108.244.59:443","token":"relay-token-1"},
+		{"name":"edge-relay","url":"https://example.internal/","token":"relay-token-2"}
+	]`, "", "")
+	if err != nil {
+		t.Fatalf("expected valid json config, got error: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 relay entries, got %d", len(got))
+	}
+
+	if got[0].Name != "nl-relay" || got[0].URL != "https://176.108.244.59:443" || got[0].Token != "relay-token-1" {
+		t.Fatalf("unexpected first relay: %+v", got[0])
+	}
+	if got[1].Name != "edge-relay" || got[1].Token != "relay-token-2" {
+		t.Fatalf("unexpected second relay: %+v", got[1])
+	}
+}
+
+func TestParseRelayConfig_LegacyFallback(t *testing.T) {
+	got, err := parseRelayConfig("", "https://176.108.244.59:443,https://edge.internal:8443", "relay-token-1,relay-token-2")
+	if err != nil {
+		t.Fatalf("legacy fallback should be accepted, got error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 relay entries, got %d", len(got))
+	}
+	if got[0].Name == "" || got[1].Name == "" {
+		t.Fatal("legacy relays must get a generated stable name")
+	}
+}
+
+func TestParseRelayConfig_MisalignedLegacyCSV_Fails(t *testing.T) {
+	_, err := parseRelayConfig("", "https://176.108.244.59:443", "token-a,token-b")
+	if err == nil {
+		t.Fatal("expected misaligned csv to fail")
+	}
+	if !strings.Contains(err.Error(), "RELAY_URLS count (1) != RELAY_TOKENS count (2)") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseRelayConfig_InvalidRelayEntry_Fails(t *testing.T) {
+	_, err := parseRelayConfig(`[{"name":"","url":"https://x","token":"t"}]`, "", "")
+	if err == nil {
+		t.Fatal("expected missing name to fail")
+	}
+
+	_, err = parseRelayConfig(`[{"name":"bad","url":"not-a-url","token":"t"}]`, "", "")
+	if err == nil {
+		t.Fatal("expected invalid URL to fail")
+	}
+
+	_, err = parseRelayConfig(`[{"name":"bad","url":"https://x","token":""}]`, "", "")
+	if err == nil {
+		t.Fatal("expected missing token to fail")
+	}
+}
+
+func TestParseRelayConfig_DuplicateNames_Fails(t *testing.T) {
+	_, err := parseRelayConfig(`[{"name":"dupe","url":"https://a","token":"t1"},{"name":"dupe","url":"https://b","token":"t2"}]`, "", "")
+	if err == nil {
+		t.Fatal("expected duplicate names to fail")
+	}
+}
 
 func TestBackoff_ConsecutiveFailuresIncreaseDelay(t *testing.T) {
 	tracker := newRelayTracker([]string{"relay-a"})
@@ -106,13 +175,16 @@ func TestManualTrigger_BypassesBackoff(t *testing.T) {
 	defer failRelay.Close()
 
 	cfg := config{
-		apiURL:       apiServer.URL,
-		apiToken:     "test-token",
-		relayURLs:    []string{failRelay.URL},
-		relayTokens:  []string{"relay-token"},
+		apiURL:   apiServer.URL,
+		apiToken: "test-token",
+		relays: []relayTarget{{
+			Name:  "fail-relay",
+			URL:   failRelay.URL,
+			Token: "relay-token",
+		}},
 		syncInterval: time.Minute,
 	}
-	tracker := newRelayTracker(cfg.relayURLs)
+	tracker := newRelayTracker([]string{"fail-relay"})
 	metrics := newTestMetrics(t)
 
 	// Cause failures to enter backoff by using bypass mode (simulating manual retries).
@@ -121,8 +193,8 @@ func TestManualTrigger_BypassesBackoff(t *testing.T) {
 		_, _ = runSync(cfg, tracker, metrics, true)
 	}
 
-	if tracker.consecutiveFailures(failRelay.URL) != 5 {
-		t.Fatalf("expected 5 failures, got %d", tracker.consecutiveFailures(failRelay.URL))
+	if tracker.consecutiveFailures("fail-relay") != 5 {
+		t.Fatalf("expected 5 failures, got %d", tracker.consecutiveFailures("fail-relay"))
 	}
 
 	// Periodic sync should skip due to backoff.
@@ -132,7 +204,7 @@ func TestManualTrigger_BypassesBackoff(t *testing.T) {
 	}
 	foundSkipped := false
 	for _, r := range result.Relays {
-		if r.Relay == failRelay.URL && r.Skipped {
+		if r.Relay == "fail-relay" && r.Skipped {
 			foundSkipped = true
 		}
 	}
@@ -146,7 +218,7 @@ func TestManualTrigger_BypassesBackoff(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	for _, r := range result.Relays {
-		if r.Relay == failRelay.URL && r.Skipped {
+		if r.Relay == "fail-relay" && r.Skipped {
 			t.Fatal("expected relay NOT to be skipped during manual trigger")
 		}
 	}
@@ -220,14 +292,17 @@ func TestRunSync_SkipsRelayPushOnUnchangedUUIDs(t *testing.T) {
 	defer relayServer.Close()
 
 	cfg := config{
-		apiURL:          apiServer.URL,
-		apiToken:        "test-token",
-		relayURLs:       []string{relayServer.URL},
-		relayTokens:     []string{"relay-token"},
+		apiURL:   apiServer.URL,
+		apiToken: "test-token",
+		relays: []relayTarget{{
+			Name:  "relay-sync-target",
+			URL:   relayServer.URL,
+			Token: "relay-token",
+		}},
 		activeUUIDState: state,
 		syncInterval:    time.Second,
 	}
-	tracker := newRelayTracker(cfg.relayURLs)
+	tracker := newRelayTracker([]string{"relay-sync-target"})
 	metrics := newTestMetrics(t)
 
 	_, err := runSync(cfg, tracker, metrics, false)

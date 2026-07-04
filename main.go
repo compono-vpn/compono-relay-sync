@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"slices"
@@ -27,13 +28,24 @@ import (
 type config struct {
 	apiURL                string
 	apiToken              string
-	relayURLs             []string
-	relayTokens           []string
+	relays                []relayTarget
 	listenAddr            string
 	syncInterval          time.Duration
 	activeUUIDState       *activeUUIDState
 	exitObserverInterval  time.Duration
 	exitObserverReconcile bool
+}
+
+type relayTarget struct {
+	Name  string
+	URL   string
+	Token string
+}
+
+type relayConfig struct {
+	Name  string `json:"name"`
+	URL   string `json:"url"`
+	Token string `json:"token"`
 }
 
 type uuidsResponse struct {
@@ -87,12 +99,12 @@ var syncMu sync.Mutex
 
 func main() {
 	cfg := mustLoadConfig()
-	tracker := newRelayTracker(cfg.relayURLs)
+	tracker := newRelayTracker(relayNames(cfg.relays))
 	metrics := newSyncMetrics()
 	exitMetrics := newExitMetrics()
 
 	log.Printf("relay-sync: api=%s relays=%d listen=%s interval=%s exit_observer_interval=%s exit_observer_reconcile=%t",
-		cfg.apiURL, len(cfg.relayURLs), cfg.listenAddr, cfg.syncInterval, cfg.exitObserverInterval, cfg.exitObserverReconcile)
+		cfg.apiURL, len(cfg.relays), cfg.listenAddr, cfg.syncInterval, cfg.exitObserverInterval, cfg.exitObserverReconcile)
 
 	mux := http.NewServeMux()
 
@@ -115,7 +127,7 @@ func main() {
 
 		resp := healthResponse{
 			Status:       status,
-			RelayCount:   len(cfg.relayURLs),
+			RelayCount:   len(cfg.relays),
 			DegradedList: degraded,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -226,10 +238,10 @@ func runSync(cfg config, tracker *relayTracker, metrics *syncMetrics, bypassBack
 	}
 
 	if !changed {
-		results := make([]relayResult, 0, len(cfg.relayURLs))
-		for _, relayURL := range cfg.relayURLs {
-			results = append(results, relayResult{Relay: relayURL, Status: "skipped", Skipped: true})
-			metrics.recordRun(relayURL, "skipped", 0, 0)
+		results := make([]relayResult, 0, len(cfg.relays))
+		for _, relay := range cfg.relays {
+			results = append(results, relayResult{Relay: relay.Name, Status: "skipped", Skipped: true})
+			metrics.recordRun(relay.Name, "skipped", 0, 0)
 		}
 
 		return &triggerResponse{
@@ -240,18 +252,18 @@ func runSync(cfg config, tracker *relayTracker, metrics *syncMetrics, bypassBack
 		}, nil
 	}
 
-	resultsCh := make(chan relayResult, len(cfg.relayURLs))
+	resultsCh := make(chan relayResult, len(cfg.relays))
 	var wg sync.WaitGroup
 
-	for i, relayURL := range cfg.relayURLs {
-		token := cfg.relayTokens[i]
+	for _, relay := range cfg.relays {
+		target := relay
 
 		// Check backoff unless this is a manual trigger.
-		if !bypassBackoff && tracker.shouldSkip(relayURL, time.Now()) {
-			log.Printf("relay %s: skipped (backoff, %d consecutive failures)",
-				relayURL, tracker.consecutiveFailures(relayURL))
+		if !bypassBackoff && tracker.shouldSkip(target.Name, time.Now()) {
+			log.Printf("relay %s (%s): skipped (backoff, %d consecutive failures)",
+				target.Name, target.URL, tracker.consecutiveFailures(target.Name))
 			resultsCh <- relayResult{
-				Relay:   relayURL,
+				Relay:   target.Name,
 				Status:  "skipped",
 				Skipped: true,
 			}
@@ -259,22 +271,22 @@ func runSync(cfg config, tracker *relayTracker, metrics *syncMetrics, bypassBack
 		}
 
 		wg.Add(1)
-		go func(relayURL, token string) {
+		go func(relay relayTarget) {
 			defer wg.Done()
-			syncURL := strings.TrimRight(relayURL, "/") + "/sync"
+			syncURL := strings.TrimRight(relay.URL, "/") + "/sync"
 			relayStart := time.Now()
 
-			resp, syncErr := pushToRelay(syncURL, token, uuids)
+			resp, syncErr := pushToRelay(syncURL, relay.Token, uuids)
 			duration := time.Since(relayStart).Seconds()
 			now := time.Now()
 
 			if syncErr != nil {
-				log.Printf("relay %s: ERROR: %v", relayURL, syncErr)
-				tracker.recordFailure(relayURL, now, syncErr.Error())
-				consecFails := tracker.consecutiveFailures(relayURL)
-				metrics.recordRun(relayURL, "error", duration, consecFails)
+				log.Printf("relay %s (%s): ERROR: %v", relay.Name, relay.URL, syncErr)
+				tracker.recordFailure(relay.Name, now, syncErr.Error())
+				consecFails := tracker.consecutiveFailures(relay.Name)
+				metrics.recordRun(relay.Name, "error", duration, consecFails)
 				resultsCh <- relayResult{
-					Relay:  relayURL,
+					Relay:  relay.Name,
 					Status: "error",
 					Error:  syncErr.Error(),
 				}
@@ -282,25 +294,25 @@ func runSync(cfg config, tracker *relayTracker, metrics *syncMetrics, bypassBack
 			}
 
 			if resp.Changed {
-				log.Printf("relay %s: CHANGED (now %d users)", relayURL, resp.UserCount)
+				log.Printf("relay %s (%s): CHANGED (now %d users)", relay.Name, relay.URL, resp.UserCount)
 			}
 
-			tracker.recordSuccess(relayURL, now, resp.UserCount, resp.Changed)
-			metrics.recordRun(relayURL, "success", duration, 0)
+			tracker.recordSuccess(relay.Name, now, resp.UserCount, resp.Changed)
+			metrics.recordRun(relay.Name, "success", duration, 0)
 
 			resultsCh <- relayResult{
-				Relay:     relayURL,
+				Relay:     relay.Name,
 				Status:    "ok",
 				Changed:   resp.Changed,
 				UserCount: resp.UserCount,
 			}
-		}(relayURL, token)
+		}(target)
 	}
 
 	wg.Wait()
 	close(resultsCh)
 
-	results := make([]relayResult, 0, len(cfg.relayURLs))
+	results := make([]relayResult, 0, len(cfg.relays))
 	hasError := false
 	for r := range resultsCh {
 		if r.Status == "error" {
@@ -333,21 +345,13 @@ func mustLoadConfig() config {
 		log.Fatal("REMNAWAVE_API_TOKEN is required")
 	}
 
-	relayURLsStr := os.Getenv("RELAY_URLS")
-	if relayURLsStr == "" {
-		log.Fatal("RELAY_URLS is required")
-	}
-
-	relayTokensStr := os.Getenv("RELAY_TOKENS")
-	if relayTokensStr == "" {
-		log.Fatal("RELAY_TOKENS is required")
-	}
-
-	relayURLs := strings.Split(relayURLsStr, ",")
-	relayTokens := strings.Split(relayTokensStr, ",")
-
-	if len(relayURLs) != len(relayTokens) {
-		log.Fatalf("RELAY_URLS count (%d) != RELAY_TOKENS count (%d)", len(relayURLs), len(relayTokens))
+	relays, err := parseRelayConfig(
+		os.Getenv("RELAY_CONFIG"),
+		os.Getenv("RELAY_URLS"),
+		os.Getenv("RELAY_TOKENS"),
+	)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	listenAddr := cmp.Or(os.Getenv("LISTEN_ADDR"), ":8080")
@@ -390,14 +394,112 @@ func mustLoadConfig() config {
 	return config{
 		apiURL:                apiURL,
 		apiToken:              apiToken,
-		relayURLs:             relayURLs,
-		relayTokens:           relayTokens,
+		relays:                relays,
 		listenAddr:            listenAddr,
 		syncInterval:          syncInterval,
 		activeUUIDState:       activeUUIDState,
 		exitObserverInterval:  exitObserverInterval,
 		exitObserverReconcile: exitObserverReconcile,
 	}
+}
+
+func parseRelayConfig(relayConfigJSON, relayURLsStr, relayTokensStr string) ([]relayTarget, error) {
+	if configJSON := strings.TrimSpace(relayConfigJSON); configJSON != "" {
+		var entries []relayConfig
+		if err := json.Unmarshal([]byte(configJSON), &entries); err != nil {
+			return nil, fmt.Errorf("invalid RELAY_CONFIG JSON: %w", err)
+		}
+		return validateRelayConfig(entries)
+	}
+
+	legacyURLs, err := parseCSVList("RELAY_URLS", relayURLsStr)
+	if err != nil {
+		return nil, err
+	}
+
+	legacyTokens, err := parseCSVList("RELAY_TOKENS", relayTokensStr)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(legacyURLs) != len(legacyTokens) {
+		return nil, fmt.Errorf("RELAY_URLS count (%d) != RELAY_TOKENS count (%d)", len(legacyURLs), len(legacyTokens))
+	}
+
+	entries := make([]relayConfig, len(legacyURLs))
+	for i, u := range legacyURLs {
+		entries[i] = relayConfig{
+			Name:  legacyRelayName(u, i),
+			URL:   u,
+			Token: legacyTokens[i],
+		}
+	}
+
+	return validateRelayConfig(entries)
+}
+
+func parseCSVList(name, value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, fmt.Errorf("%s is required", name)
+	}
+	raw := strings.Split(value, ",")
+	out := make([]string, 0, len(raw))
+	for i, v := range raw {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return nil, fmt.Errorf("%s has blank element at index %d", name, i)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+func validateRelayConfig(entries []relayConfig) ([]relayTarget, error) {
+	seen := make(map[string]struct{}, len(entries))
+	out := make([]relayTarget, 0, len(entries))
+	for i, entry := range entries {
+		name := strings.TrimSpace(entry.Name)
+		if name == "" {
+			return nil, fmt.Errorf("RELAY_CONFIG entry %d: missing name", i)
+		}
+		u := strings.TrimSpace(entry.URL)
+		if u == "" {
+			return nil, fmt.Errorf("RELAY_CONFIG entry %d (%s): missing url", i, name)
+		}
+		if _, err := url.ParseRequestURI(u); err != nil {
+			return nil, fmt.Errorf("RELAY_CONFIG entry %d (%s): invalid url %q: %v", i, name, u, err)
+		}
+		token := strings.TrimSpace(entry.Token)
+		if token == "" {
+			return nil, fmt.Errorf("RELAY_CONFIG entry %d (%s): missing token", i, name)
+		}
+		if _, exists := seen[name]; exists {
+			return nil, fmt.Errorf("RELAY_CONFIG has duplicate relay name %q", name)
+		}
+		seen[name] = struct{}{}
+		out = append(out, relayTarget{
+			Name:  name,
+			URL:   u,
+			Token: token,
+		})
+	}
+	return out, nil
+}
+
+func relayNames(relays []relayTarget) []string {
+	names := make([]string, 0, len(relays))
+	for _, r := range relays {
+		names = append(names, r.Name)
+	}
+	return names
+}
+
+func legacyRelayName(rawURL string, index int) string {
+	parsed, err := url.ParseRequestURI(rawURL)
+	if err != nil || parsed.Host == "" {
+		return fmt.Sprintf("relay-%d", index+1)
+	}
+	return parsed.Host
 }
 
 func fetchActiveUUIDs(cfg config) ([]string, bool, error) {
