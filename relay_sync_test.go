@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,10 +89,12 @@ func TestBackoff_CappedAt60s(t *testing.T) {
 }
 
 func TestManualTrigger_BypassesBackoff(t *testing.T) {
+	var calls int64
 	// Set up a mock API server that returns UUIDs.
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := atomic.AddInt64(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"response":{"uuids":["uuid-1","uuid-2"]}}`)
+		_, _ = fmt.Fprintf(w, `{"response":{"uuids":["uuid-%d"]}}`, call)
 	}))
 	defer apiServer.Close()
 
@@ -146,6 +149,107 @@ func TestManualTrigger_BypassesBackoff(t *testing.T) {
 		if r.Relay == failRelay.URL && r.Skipped {
 			t.Fatal("expected relay NOT to be skipped during manual trigger")
 		}
+	}
+}
+
+func TestFetchActiveUUIDs_UsesETagAndSkipsUnchanged(t *testing.T) {
+	state := &activeUUIDState{}
+	var calls int32
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := atomic.AddInt32(&calls, 1)
+		if call == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("ETag", `"v1"`)
+			_, _ = fmt.Fprint(w, `{"response":{"uuids":["uuid-1"]}}`)
+			return
+		}
+
+		if r.Header.Get("If-None-Match") != "v1" {
+			t.Fatalf("expected If-None-Match=v1, got %q", r.Header.Get("If-None-Match"))
+		}
+
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer apiServer.Close()
+
+	cfg := config{
+		apiURL:          apiServer.URL,
+		apiToken:        "test-token",
+		activeUUIDState: state,
+	}
+
+	uuids, changed, err := fetchActiveUUIDs(cfg)
+	if err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	if !changed {
+		t.Fatal("first fetch should be treated as changed")
+	}
+	if got, want := len(uuids), 1; got != want {
+		t.Fatalf("first fetch count=%d want %d", got, want)
+	}
+
+	uuids, changed, err = fetchActiveUUIDs(cfg)
+	if err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	if changed {
+		t.Fatal("second fetch should be treated as unchanged")
+	}
+	if got, want := len(uuids), 1; got != want {
+		t.Fatalf("second fetch count=%d want %d", got, want)
+	}
+}
+
+func TestRunSync_SkipsRelayPushOnUnchangedUUIDs(t *testing.T) {
+	state := &activeUUIDState{}
+	apiCalls := int32(0)
+	relayCalls := int32(0)
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = atomic.AddInt32(&apiCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"response":{"uuids":["uuid-1"]}}`)
+	}))
+	defer apiServer.Close()
+
+	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = atomic.AddInt32(&relayCalls, 1)
+		_, _ = fmt.Fprint(w, `{"status":"ok","changed":false,"user_count":1}`)
+	}))
+	defer relayServer.Close()
+
+	cfg := config{
+		apiURL:          apiServer.URL,
+		apiToken:        "test-token",
+		relayURLs:       []string{relayServer.URL},
+		relayTokens:     []string{"relay-token"},
+		activeUUIDState: state,
+		syncInterval:    time.Second,
+	}
+	tracker := newRelayTracker(cfg.relayURLs)
+	metrics := newTestMetrics(t)
+
+	_, err := runSync(cfg, tracker, metrics, false)
+	if err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if got, want := atomic.LoadInt32(&relayCalls), int32(1); got != want {
+		t.Fatalf("first sync relay calls=%d want %d", got, want)
+	}
+
+	res, err := runSync(cfg, tracker, metrics, false)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if len(res.Relays) != 1 || !res.Relays[0].Skipped {
+		t.Fatalf("expected relay marked skipped, got %+v", res.Relays)
+	}
+	if got, want := atomic.LoadInt32(&relayCalls), int32(1); got != want {
+		t.Fatalf("second sync relay calls=%d want unchanged at %d", got, want)
+	}
+	if got, want := atomic.LoadInt32(&apiCalls), int32(2); got != want {
+		t.Fatalf("expected API called twice, got %d", got)
 	}
 }
 
