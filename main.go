@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,6 +31,7 @@ type config struct {
 	relayTokens           []string
 	listenAddr            string
 	syncInterval          time.Duration
+	activeUUIDState       *activeUUIDState
 	exitObserverInterval  time.Duration
 	exitObserverReconcile bool
 }
@@ -37,6 +40,14 @@ type uuidsResponse struct {
 	Response struct {
 		UUIDs []string `json:"uuids"`
 	} `json:"response"`
+}
+
+type activeUUIDState struct {
+	mu      sync.RWMutex
+	etag    string
+	hash    string
+	uuids   []string
+	hasData bool
 }
 
 type syncRequest struct {
@@ -205,13 +216,29 @@ func runSync(cfg config, tracker *relayTracker, metrics *syncMetrics, bypassBack
 	defer syncMu.Unlock()
 
 	start := time.Now()
+	if cfg.activeUUIDState == nil {
+		cfg.activeUUIDState = &activeUUIDState{}
+	}
 
-	uuids, err := fetchActiveUUIDs(cfg)
+	uuids, changed, err := fetchActiveUUIDs(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("fetch UUIDs: %w", err)
 	}
 
-	slices.Sort(uuids)
+	if !changed {
+		results := make([]relayResult, 0, len(cfg.relayURLs))
+		for _, relayURL := range cfg.relayURLs {
+			results = append(results, relayResult{Relay: relayURL, Status: "skipped", Skipped: true})
+			metrics.recordRun(relayURL, "skipped", 0, 0)
+		}
+
+		return &triggerResponse{
+			Status:   "ok",
+			UUIDs:    len(uuids),
+			Relays:   results,
+			Duration: time.Since(start).String(),
+		}, nil
+	}
 
 	resultsCh := make(chan relayResult, len(cfg.relayURLs))
 	var wg sync.WaitGroup
@@ -325,7 +352,7 @@ func mustLoadConfig() config {
 
 	listenAddr := cmp.Or(os.Getenv("LISTEN_ADDR"), ":8080")
 
-	syncInterval := 1 * time.Second
+	syncInterval := 10 * time.Second
 	if s := os.Getenv("SYNC_INTERVAL"); s != "" {
 		d, err := time.ParseDuration(s)
 		if err != nil {
@@ -333,6 +360,7 @@ func mustLoadConfig() config {
 		}
 		syncInterval = d
 	}
+	activeUUIDState := &activeUUIDState{}
 
 	exitObserverInterval := 60 * time.Second
 	if s := os.Getenv("EXIT_OBSERVER_INTERVAL"); s != "" {
@@ -366,17 +394,26 @@ func mustLoadConfig() config {
 		relayTokens:           relayTokens,
 		listenAddr:            listenAddr,
 		syncInterval:          syncInterval,
+		activeUUIDState:       activeUUIDState,
 		exitObserverInterval:  exitObserverInterval,
 		exitObserverReconcile: exitObserverReconcile,
 	}
 }
 
-func fetchActiveUUIDs(cfg config) ([]string, error) {
+func fetchActiveUUIDs(cfg config) ([]string, bool, error) {
+	if cfg.activeUUIDState == nil {
+		cfg.activeUUIDState = &activeUUIDState{}
+	}
+
 	url := strings.TrimRight(cfg.apiURL, "/") + "/api/users/active-vless-uuids"
+	etag := cfg.activeUUIDState.etagHeader()
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, false, fmt.Errorf("create request: %w", err)
+	}
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.apiToken)
 	req.Header.Set("X-Forwarded-Proto", "https")
@@ -385,25 +422,98 @@ func fetchActiveUUIDs(cfg config) ([]string, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, false, fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusNotModified {
+		return cfg.activeUUIDState.snapshotUUIDs(), false, nil
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, false, fmt.Errorf("read body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+		return nil, false, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result uuidsResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
+		return nil, false, fmt.Errorf("parse response: %w", err)
 	}
 
-	return result.Response.UUIDs, nil
+	uuids := result.Response.UUIDs
+	if uuids == nil {
+		uuids = []string{}
+	}
+	slices.Sort(uuids)
+	h := hashUUIDs(uuids)
+	respTag := strings.Trim(resp.Header.Get("ETag"), "\"")
+
+	current := cfg.activeUUIDState.snapshotHash()
+	changed := true
+	if current.hasData {
+		changed = h != current.hash
+	}
+
+	cfg.activeUUIDState.replace(uuids, h, respTag)
+
+	return uuids, changed, nil
+}
+
+func hashUUIDs(uuids []string) string {
+	if len(uuids) == 0 {
+		return "empty"
+	}
+	sum := sha256.Sum256([]byte(strings.Join(uuids, ",")))
+	return hex.EncodeToString(sum[:])
+}
+
+type activeUUIDStateSnapshot struct {
+	hash    string
+	etag    string
+	uuids   []string
+	hasData bool
+}
+
+func (s *activeUUIDState) etagHeader() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.etag
+}
+
+func (s *activeUUIDState) replace(uuids []string, hash, etag string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hash = hash
+	s.etag = etag
+	s.hasData = true
+	s.uuids = append(make([]string, 0, len(uuids)), uuids...)
+}
+
+func (s *activeUUIDState) snapshotHash() activeUUIDStateSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return activeUUIDStateSnapshot{
+		hash:    s.hash,
+		etag:    s.etag,
+		uuids:   append([]string(nil), s.uuids...),
+		hasData: s.hasData,
+	}
+}
+
+func (s *activeUUIDState) snapshotUUIDs() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.hasData {
+		return nil
+	}
+	return append([]string(nil), s.uuids...)
 }
 
 // relayClient is an HTTP client that skips TLS verification for relay agents

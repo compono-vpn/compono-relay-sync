@@ -168,10 +168,6 @@ func (o *exitObserver) observeNode(ctx context.Context, n panelNode) {
 
 	// Index expected by (username → tag set) per user.
 	// username in xray = t_id string in panel.
-	type key struct {
-		tag      string
-		username string
-	}
 	expectedByTag := map[string]map[string]struct{}{}
 	for _, u := range expected.Response.Users {
 		username := fmt.Sprintf("%d", u.TID)
