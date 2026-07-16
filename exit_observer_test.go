@@ -143,6 +143,40 @@ func TestExitObserver_ReconcileHTTP500_LogsErrorAndKeepsRunning(t *testing.T) {
 	}
 }
 
+func TestExitObserver_HysteriaTagsDoNotEmitLegacyDriftOrReconcile(t *testing.T) {
+	var reconcileCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/nodes":
+			_, _ = w.Write([]byte(`{"response":[{"uuid":"n1","name":"Hysteria-Canary","isConnected":true,"isDisabled":false,"configProfile":{"activeInbounds":[{"tag":"hysteria2-canary","type":"hysteria"}]}}]}`))
+		case strings.HasSuffix(r.URL.Path, "/expected-users"):
+			_, _ = w.Write([]byte(`{"response":{"nodeUuid":"n1","users":[{"tId":1,"username":"a","inboundTags":["hysteria2-canary"]}]}}`))
+		case strings.HasSuffix(r.URL.Path, "/actual-users"):
+			_, _ = w.Write([]byte(`{"response":{"nodeUuid":"n1","users":[],"unreachableTags":[]}}`))
+		case strings.HasSuffix(r.URL.Path, "/reconcile-users"):
+			reconcileCalls.Add(1)
+			http.Error(w, "must not reconcile unsupported user accounting", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	metrics := newTestExitMetrics()
+	obs := newExitObserver(server.URL, "tok", time.Hour, metrics, true)
+	if err := obs.tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if reconcileCalls.Load() != 0 {
+		t.Fatalf("expected no reconcile call for Hysteria accounting, got %d", reconcileCalls.Load())
+	}
+
+	metricCh := make(chan prometheus.Metric, 1)
+	metrics.missingUsers.Collect(metricCh)
+	close(metricCh)
+	if len(metricCh) != 0 {
+		t.Fatalf("expected no legacy drift series for Hysteria, got %d", len(metricCh))
+	}
+}
+
 // newTestExitMetrics builds an exitMetrics whose vectors are NOT registered
 // in the default promauto registry — needed because go test runs all tests
 // in one process and promauto panics on duplicate registrations.

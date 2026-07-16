@@ -39,10 +39,16 @@ import (
 // per-exit feature flag + churn caps, then retire the backend events.
 
 type panelNode struct {
-	UUID        string `json:"uuid"`
-	Name        string `json:"name"`
-	IsConnected bool   `json:"isConnected"`
-	IsDisabled  bool   `json:"isDisabled"`
+	UUID          string `json:"uuid"`
+	Name          string `json:"name"`
+	IsConnected   bool   `json:"isConnected"`
+	IsDisabled    bool   `json:"isDisabled"`
+	ConfigProfile struct {
+		ActiveInbounds []struct {
+			Tag  string `json:"tag"`
+			Type string `json:"type"`
+		} `json:"activeInbounds"`
+	} `json:"configProfile"`
 }
 
 type expectedUsersResponse struct {
@@ -152,6 +158,19 @@ func (o *exitObserver) tick(ctx context.Context) error {
 }
 
 func (o *exitObserver) observeNode(ctx context.Context, n panelNode) {
+	// Remnawave Node 2.8 serves Hysteria2 users correctly, but its
+	// get-inbound-users control endpoint does not expose them through the
+	// legacy username list consumed by this observer. Comparing that empty
+	// list to panel users creates false drift pages and the reconcile writer
+	// cannot safely act on it. Keep observing protocols with supported user
+	// accounting and omit Hysteria tags until the node contract exposes them.
+	unsupportedTags := map[string]struct{}{}
+	for _, inbound := range n.ConfigProfile.ActiveInbounds {
+		if strings.EqualFold(inbound.Type, "hysteria") {
+			unsupportedTags[inbound.Tag] = struct{}{}
+		}
+	}
+
 	expected, err := o.fetchExpectedUsers(ctx, n.UUID)
 	if err != nil {
 		log.Printf("exit-observer %s: fetch expected: %v", n.Name, err)
@@ -172,6 +191,9 @@ func (o *exitObserver) observeNode(ctx context.Context, n panelNode) {
 	for _, u := range expected.Response.Users {
 		username := fmt.Sprintf("%d", u.TID)
 		for _, tag := range u.InboundTags {
+			if _, unsupported := unsupportedTags[tag]; unsupported {
+				continue
+			}
 			if expectedByTag[tag] == nil {
 				expectedByTag[tag] = map[string]struct{}{}
 			}
@@ -182,6 +204,9 @@ func (o *exitObserver) observeNode(ctx context.Context, n panelNode) {
 	actualByTag := map[string]map[string]struct{}{}
 	for _, u := range actual.Response.Users {
 		for _, tag := range u.InboundTags {
+			if _, unsupported := unsupportedTags[tag]; unsupported {
+				continue
+			}
 			if actualByTag[tag] == nil {
 				actualByTag[tag] = map[string]struct{}{}
 			}
@@ -235,7 +260,7 @@ func (o *exitObserver) observeNode(ctx context.Context, n panelNode) {
 	// add/remove RPCs synchronously; we just trigger and tally. Replaces the
 	// flaky AddUserToNodeEvent push (BDT-27) — the user said: "those kafka
 	// messages and pushes will NEVER be reliable".
-	if o.reconcileEnabled {
+	if o.reconcileEnabled && len(unsupportedTags) == 0 {
 		o.callReconcile(ctx, n)
 	}
 }
