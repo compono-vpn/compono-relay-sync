@@ -26,6 +26,9 @@ import (
 )
 
 type config struct {
+	paidRelay             bool
+	billingURL            string
+	billingToken          string
 	apiURL                string
 	apiToken              string
 	relays                []relayTarget
@@ -63,14 +66,16 @@ type activeUUIDState struct {
 }
 
 type syncRequest struct {
-	UUIDs []string `json:"uuids"`
+	UUIDs      []string   `json:"uuids"`
+	ValidUntil *time.Time `json:"valid_until,omitempty"`
 }
 
 type syncResponse struct {
-	Status    string `json:"status"`
-	Changed   bool   `json:"changed"`
-	UserCount int    `json:"user_count"`
-	Error     string `json:"error,omitempty"`
+	AuthorizationValidUntil *time.Time `json:"authorization_valid_until,omitempty"`
+	Status                  string     `json:"status"`
+	Changed                 bool       `json:"changed"`
+	UserCount               int        `json:"user_count"`
+	Error                   string     `json:"error,omitempty"`
 }
 
 type relayResult struct {
@@ -232,7 +237,16 @@ func runSync(cfg config, tracker *relayTracker, metrics *syncMetrics, bypassBack
 		cfg.activeUUIDState = &activeUUIDState{}
 	}
 
-	uuids, changed, err := fetchActiveUUIDs(cfg)
+	var uuids []string
+	var changed bool
+	var err error
+	var validUntil time.Time
+	if cfg.paidRelay {
+		uuids, validUntil, err = fetchPaidUUIDs(cfg)
+		changed = true // renew the lease even when membership is unchanged
+	} else {
+		uuids, changed, err = fetchActiveUUIDs(cfg)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("fetch UUIDs: %w", err)
 	}
@@ -276,7 +290,7 @@ func runSync(cfg config, tracker *relayTracker, metrics *syncMetrics, bypassBack
 			syncURL := strings.TrimRight(relay.URL, "/") + "/sync"
 			relayStart := time.Now()
 
-			resp, syncErr := pushToRelay(syncURL, relay.Token, uuids)
+			resp, syncErr := pushToRelay(syncURL, relay.Token, uuids, validUntil)
 			duration := time.Since(relayStart).Seconds()
 			now := time.Now()
 
@@ -391,7 +405,13 @@ func mustLoadConfig() config {
 		}
 	}
 
+	paidRelay := os.Getenv("PAID_RELAY_ENABLED") == "true"
+	billingURL, billingToken := os.Getenv("BILLING_API_URL"), os.Getenv("BILLING_INTERNAL_SECRET")
+	if paidRelay && (billingURL == "" || billingToken == "" || syncInterval <= 0 || syncInterval > 30*time.Second) {
+		log.Fatal("paid relay requires billing API credentials and sync interval <=30s")
+	}
 	return config{
+		paidRelay: paidRelay, billingURL: billingURL, billingToken: billingToken,
 		apiURL:                apiURL,
 		apiToken:              apiToken,
 		relays:                relays,
@@ -628,8 +648,15 @@ var relayClient = &http.Client{
 	},
 }
 
-func pushToRelay(syncURL, token string, uuids []string) (*syncResponse, error) {
-	payload, err := json.Marshal(syncRequest{UUIDs: uuids})
+func pushToRelay(syncURL, token string, uuids []string, deadlines ...time.Time) (*syncResponse, error) {
+	request := syncRequest{UUIDs: uuids}
+	if len(deadlines) > 0 && !deadlines[0].IsZero() {
+		request.ValidUntil = &deadlines[0]
+		if err := verifyPaidAgent(syncURL, token); err != nil {
+			return nil, err
+		}
+	}
+	payload, err := json.Marshal(request)
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
@@ -661,5 +688,8 @@ func pushToRelay(syncURL, token string, uuids []string) (*syncResponse, error) {
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 
+	if request.ValidUntil != nil && (result.AuthorizationValidUntil == nil || !result.AuthorizationValidUntil.Equal(*request.ValidUntil)) {
+		return nil, fmt.Errorf("relay did not acknowledge authorization lease")
+	}
 	return &result, nil
 }
