@@ -33,3 +33,11 @@ Configuration parsing rejects invalid PAID_RELAY_ENABLED values instead of
 silently selecting legacy mode. Empty/false retain legacy behavior; true enables
 paid mode (case and surrounding whitespace normalized). Test-first regression
 and complete race suite passed on 2026-10-07.
+
+Real-account traffic now passed against the selective-revocation agent/Xray
+canary: current production billing/native reads populated 26 paid grants; one
+paid account transferred 128,000 bytes over 125.15 seconds and an active trial
+account was rejected before/after. No billing records changed. The controller
+was stopped and canary grants explicitly cleared and read back. This verifies
+the control-plane decision plus plain TCP runtime authorization on the isolated
+host, not production transport or mobile coverage. Production remains unchanged.
