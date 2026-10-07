@@ -22,3 +22,14 @@ Tests cover expiry bounding, stale snapshots, source authentication, rejection
 of legacy agents before credentials are posted, and end-to-end lease JSON
 acknowledgement. Full race suite passes. Remaining: crash-safe agent deployment,
 live canary admission/revocation tests, subscription visibility and rollout.
+
+Live isolated integration now verified: production billing v0.40.0 -> native
+account lookup -> this controller -> loopback-only paid agent, 26 credentials,
+lease renewal acknowledged and no controller failures. Production enforcement
+is still disabled. Synthetic traffic admission/expiry/watchdog evidence is in
+compono-infra/docs/repro/2026-10-07-paid-relay; real-account traffic remains a gate.
+
+Configuration parsing rejects invalid PAID_RELAY_ENABLED values instead of
+silently selecting legacy mode. Empty/false retain legacy behavior; true enables
+paid mode (case and surrounding whitespace normalized). Test-first regression
+and complete race suite passed on 2026-10-07.

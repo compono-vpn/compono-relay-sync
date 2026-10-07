@@ -130,3 +130,15 @@ func verifyPaidAgent(syncURL, token string) error {
 	}
 	return nil
 }
+
+// A misspelled opt-in must not silently select unrestricted legacy synchronization.
+func parsePaidMode(value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "false":
+		return false, nil
+	case "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("PAID_RELAY_ENABLED must be true or false")
+	}
+}

@@ -405,7 +405,10 @@ func mustLoadConfig() config {
 		}
 	}
 
-	paidRelay := os.Getenv("PAID_RELAY_ENABLED") == "true"
+	paidRelay, err := parsePaidMode(os.Getenv("PAID_RELAY_ENABLED"))
+	if err != nil {
+		log.Fatal(err)
+	}
 	billingURL, billingToken := os.Getenv("BILLING_API_URL"), os.Getenv("BILLING_INTERNAL_SECRET")
 	if paidRelay && (billingURL == "" || billingToken == "" || syncInterval <= 0 || syncInterval > 30*time.Second) {
 		log.Fatal("paid relay requires billing API credentials and sync interval <=30s")
